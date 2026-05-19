@@ -1,7 +1,10 @@
 import asyncio
+import datetime
+import os
 import uuid
 
 import httpx
+import pandas as pd
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -19,74 +22,121 @@ HEADERS = {
     "Accept": "application/json",
 }
 
+EXCEL_FILE = "roblox_trends.xlsx"
 
-@app.get("/api/trending")
-async def get_trending(genre: str = "all", limit: int = 12):
+
+async def fetch_trending_games(genre: str = "all", limit: int = 12):
     async with httpx.AsyncClient(headers=HEADERS, timeout=15) as client:
-        # Используем Omni-Search как наиболее стабильный источник данных
         search_query = "Top" if genre == "all" else genre
         session_id = str(uuid.uuid4())
 
-        print(f"Fetching games for query '{search_query}' via Omni-Search...")
-
-        search_resp = await client.get(
-            "https://apis.roblox.com/search-api/omni-search",
-            params={
-                "searchQuery": search_query,
-                "sessionId": session_id,
-                "pageType": "GameSearchResult",
-            },
+        print(
+            f"[{datetime.datetime.now()}] Fetching games for query '{search_query}'..."
         )
 
-        if search_resp.status_code != 200:
-            print(f"Search error: {search_resp.status_code} - {search_resp.text}")
-            return {
-                "error": "Failed to fetch from Roblox Search",
-                "status": search_resp.status_code,
+        try:
+            search_resp = await client.get(
+                "https://apis.roblox.com/search-api/omni-search",
+                params={
+                    "searchQuery": search_query,
+                    "sessionId": session_id,
+                    "pageType": "GameSearchResult",
+                },
+            )
+
+            if search_resp.status_code != 200:
+                print(f"Search error: {search_resp.status_code}")
+                return []
+
+            search_data = search_resp.json()
+            ids = []
+            for section in search_data.get("searchResults", []):
+                for item in section.get("contents", []):
+                    u_id = item.get("universeId")
+                    if u_id and u_id not in ids:
+                        ids.append(u_id)
+
+            ids = ids[:limit]
+            if not ids:
+                return []
+
+            detail_resp, icons_resp = await asyncio.gather(
+                client.get(
+                    "https://games.roblox.com/v1/games",
+                    params={"universeIds": ",".join(map(str, ids))},
+                ),
+                client.get(
+                    "https://thumbnails.roblox.com/v1/games/icons",
+                    params={
+                        "universeIds": ",".join(map(str, ids)),
+                        "size": "150x150",
+                        "format": "Png",
+                        "returnPolicy": "PlaceHolder",
+                    },
+                ),
+            )
+
+            if detail_resp.status_code != 200 or icons_resp.status_code != 200:
+                return []
+
+            icons = {
+                i["targetId"]: i["imageUrl"] for i in icons_resp.json().get("data", [])
             }
 
-        search_data = search_resp.json()
+            result = detail_resp.json().get("data", [])
+            for g in result:
+                g["iconUrl"] = icons.get(g["id"], "")
 
-        # Извлекаем universeId из результатов поиска
-        ids = []
-        for section in search_data.get("searchResults", []):
-            for item in section.get("contents", []):
-                u_id = item.get("universeId")
-                if u_id and u_id not in ids:
-                    ids.append(u_id)
-
-        ids = ids[:limit]
-        print(f"Found {len(ids)} unique universeIds")
-
-        if not ids:
+            return result
+        except Exception as e:
+            print(f"Error during fetch: {e}")
             return []
 
-        # Параллельная сборка деталей и иконок (твоя рабочая схема)
-        detail_resp, icons_resp = await asyncio.gather(
-            client.get(
-                "https://games.roblox.com/v1/games",
-                params={"universeIds": ",".join(map(str, ids))},
-            ),
-            client.get(
-                "https://thumbnails.roblox.com/v1/games/icons",
-                params={
-                    "universeIds": ",".join(map(str, ids)),
-                    "size": "150x150",
-                    "format": "Png",
-                    "returnPolicy": "PlaceHolder",
-                },
-            ),
-        )
 
-        if detail_resp.status_code != 200 or icons_resp.status_code != 200:
-            return {"error": "Failed to fetch details", "details": detail_resp.text}
+def save_to_excel(games):
+    if not games:
+        return
 
-        icons = {
-            i["targetId"]: i["imageUrl"] for i in icons_resp.json().get("data", [])
-        }
+    df_new = pd.DataFrame(games)
+    # Добавляем временную метку
+    df_new["timestamp"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        result = detail_resp.json().get("data", [])
-        for g in result:
-            g["iconUrl"] = icons.get(g["id"], "")
+    # Выбираем нужные колонки для удобства
+    columns = [
+        "timestamp",
+        "name",
+        "playing",
+        "visits",
+        "favoritedCount",
+        "id",
+        "creator",
+    ]
+    # Не все колонки могут быть в ответе, фильтруем существующие
+    df_new = df_new[[c for c in columns if c in df_new.columns]]
 
-        return result
+    if os.path.exists(EXCEL_FILE):
+        df_old = pd.read_excel(EXCEL_FILE)
+        df_combined = pd.concat([df_old, df_new], ignore_index=True)
+        df_combined.to_excel(EXCEL_FILE, index=False)
+    else:
+        df_new.to_excel(EXCEL_FILE, index=False)
+
+    print(f"Saved {len(games)} games to {EXCEL_FILE}")
+
+
+async def background_worker():
+    """Фоновая задача, которая запускается раз в 30 минут"""
+    while True:
+        games = await fetch_trending_games(limit=50)  # Собираем побольше для истории
+        save_to_excel(games)
+        await asyncio.sleep(60)  # 1800 секунд = 30 минут
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(background_worker())
+
+
+@app.get("/api/trending")
+async def get_trending(genre: str = "all", limit: int = 12):
+    return await fetch_trending_games(genre, limit)
