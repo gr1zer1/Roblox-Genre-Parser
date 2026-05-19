@@ -97,39 +97,74 @@ def save_to_excel(games):
     if not games:
         return
 
-    df_new = pd.DataFrame(games)
-    # Добавляем временную метку
-    df_new["timestamp"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Используем json_normalize для "выпрямления" вложенных структур (например, creator.name станет колонкой creator.name)
+    df_new = pd.json_normalize(games)
 
-    # Выбираем нужные колонки для удобства
-    columns = [
-        "timestamp",
-        "name",
-        "playing",
-        "visits",
-        "favoritedCount",
-        "id",
-        "creator",
-    ]
-    # Не все колонки могут быть в ответе, фильтруем существующие
-    df_new = df_new[[c for c in columns if c in df_new.columns]]
+    # Добавляем временную метку сбора в начало таблицы
+    df_new.insert(
+        0, "fetch_timestamp", datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    )
+
+    # Преобразуем списки и словари в строки для совместимости с Excel
+    for col in df_new.columns:
+        if df_new[col].apply(lambda x: isinstance(x, (list, dict))).any():
+            df_new[col] = df_new[col].apply(lambda x: str(x) if x is not None else "")
 
     if os.path.exists(EXCEL_FILE):
-        df_old = pd.read_excel(EXCEL_FILE)
-        df_combined = pd.concat([df_old, df_new], ignore_index=True)
-        df_combined.to_excel(EXCEL_FILE, index=False)
+        try:
+            df_old = pd.read_excel(EXCEL_FILE)
+            # Объединяем, сохраняя все уникальные колонки из обоих наборов данных
+            df_combined = pd.concat([df_old, df_new], ignore_index=True, sort=False)
+            df_combined.to_excel(EXCEL_FILE, index=False)
+        except Exception as e:
+            print(f"Error updating Excel: {e}. Creating new file.")
+            df_new.to_excel(EXCEL_FILE, index=False)
     else:
         df_new.to_excel(EXCEL_FILE, index=False)
 
-    print(f"Saved {len(games)} games to {EXCEL_FILE}")
+    print(
+        f"Saved {len(games)} games with {len(df_new.columns)} detailed fields to {EXCEL_FILE}"
+    )
 
 
 async def background_worker():
-    """Фоновая задача, которая запускается раз в 30 минут"""
+    """Фоновая задача, которая циклично обходит разные категории игр"""
+    # Список запросов для охвата большего количества разных игр
+    search_queries = [
+        "Top",
+        "Trending",
+        "Popular",
+        "New",
+        "Obby",
+        "Tycoon",
+        "Simulator",
+        "RP",
+        "Roleplay",
+        "Anime",
+        "Horror",
+        "Fighting",
+    ]
+
+    query_index = 0
+
     while True:
-        games = await fetch_trending_games(limit=50)  # Собираем побольше для истории
-        save_to_excel(games)
-        await asyncio.sleep(60)  # 1800 секунд = 30 минут
+        current_query = search_queries[query_index]
+        print(
+            f"[{datetime.datetime.now()}] Switching to search category: {current_query}"
+        )
+
+        # Собираем до 100 игр по текущему запросу
+        games = await fetch_trending_games(genre=current_query, limit=100)
+
+        if games:
+            save_to_excel(games)
+
+        # Переходим к следующему запросу в списке
+        query_index = (query_index + 1) % len(search_queries)
+
+        # Ждем 30 минут перед следующим сбором
+        # Если хочешь быстрее собрать базу из разных категорий в начале, можно уменьшить время
+        await asyncio.sleep(30)
 
 
 @app.on_event("startup")
